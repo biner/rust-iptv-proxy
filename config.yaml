@@ -1,0 +1,19 @@
+server:
+  listen: 0.0.0.0:7878
+  workers: 4
+  timeout: 30
+  log_level: "info"
+
+iptv:
+  user: true
+  passwd: 36000000
+  mac:
+  imei:
+
+m3u8:
+  x_tvg_url:
+  format_tvg:
+  extra_playlist:
+  extra_xmltv:
+  udp_proxy_uri:
+  rtsp_proxy_uri:

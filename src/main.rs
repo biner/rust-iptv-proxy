@@ -1,19 +1,19 @@
 use actix_web::{
     get,
-    web::{Data, Path, Query},
+    web::{Data, Path},
     App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use anyhow::{anyhow, Result};
-use argh::FromArgs;
+
+use std::path::PathBuf;
 use chrono::{FixedOffset, TimeZone, Utc};
-use log::debug;
+use log::{debug, info};
 use reqwest::Client;
 use std::{
-    collections::BTreeMap,
+
     io::{BufWriter, Cursor, Read},
-    net::SocketAddrV4,
-    process::exit,
-    str::FromStr,
+
+
     sync::Mutex,
 };
 use xml::{
@@ -25,13 +25,40 @@ use xml::{
 mod args;
 use args::Args;
 
+mod config;
+use config::YamlConfig;
+
+
 mod iptv;
 use iptv::{get_channels, get_icon, Channel};
 
-mod proxy;
 
 static OLD_PLAYLIST: Mutex<Option<String>> = Mutex::new(None);
 static OLD_XMLTV: Mutex<Option<String>> = Mutex::new(None);
+
+/// 合并后的应用配置
+#[derive(Clone)]
+pub struct AppConfig {
+    pub cli_args: Args,
+    pub yaml_config: YamlConfig,
+}
+
+impl AppConfig {
+    pub fn new(cli_args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+        // 验证命令行参数
+        cli_args.validate()?;
+
+        // 加载 YAML 配置
+        let config_path = PathBuf::from(&cli_args.config_file);
+        let yaml_config = YamlConfig::from_file(&config_path)?;
+
+        Ok(AppConfig {
+            cli_args,
+            yaml_config,
+        })
+    }
+}
+
 
 fn to_xmltv_time(unix_time: i64) -> Result<String> {
     match Utc.timestamp_millis_opt(unix_time) {
@@ -154,15 +181,15 @@ async fn parse_extra_xml(url: &str) -> Result<EventReader<Cursor<String>>> {
 }
 
 #[get("/xmltv")]
-async fn xmltv(args: Data<Args>, req: HttpRequest) -> impl Responder {
+async fn xmltv(config: Data<YamlConfig>, _req: HttpRequest) -> impl Responder {
     debug!("Get EPG");
-    let scheme = req.connection_info().scheme().to_owned();
-    let host = req.connection_info().host().to_owned();
-    let extra_xml = match &args.extra_xmltv {
+    // let scheme = req.connection_info().scheme().to_owned();
+    // let host = req.connection_info().host().to_owned();
+    let extra_xml = match &config.m3u8.extra_xmltv {
         Some(u) => parse_extra_xml(u).await.ok(),
         None => None,
     };
-    let xml = get_channels(&args, true, &scheme, &host)
+    let xml = get_channels(&config.iptv, true)
         .await
         .and_then(|ch| to_xmltv(ch, extra_xml));
     match xml {
@@ -177,8 +204,11 @@ async fn xmltv(args: Data<Args>, req: HttpRequest) -> impl Responder {
     }
 }
 
+
 async fn parse_extra_playlist(url: &str) -> Result<String> {
     let client = Client::builder().build()?;
+    info!("开始解析额外播放列表: {}", url);
+
     let url = reqwest::Url::parse(url)?;
     let response = client.get(url).send().await?.error_for_status()?;
     Ok(response
@@ -189,21 +219,61 @@ async fn parse_extra_playlist(url: &str) -> Result<String> {
 }
 
 #[get("/logo/{id}.png")]
-async fn logo(args: Data<Args>, path: Path<String>) -> impl Responder {
+async fn logo(config: Data<YamlConfig>, path: Path<String>) -> impl Responder {
     debug!("Get logo");
-    match get_icon(&args, &path).await {
+    match get_icon(&config.iptv, &path).await {
         Ok(icon) => HttpResponse::Ok().content_type("image/png").body(icon),
         Err(e) => HttpResponse::NotFound().body(format!("Error getting channels: {}", e)),
     }
 }
 
+/// 格式化频道名称（带详细日志，包含清理功能）
+pub fn format_channel_name(name: &str, config: &YamlConfig) -> String {
+    debug!("开始处理频道名称: {}", name);
+    
+    // 1. 先应用清理规则
+    let mut cleaned = name.to_string();
+    // 如果有自定义顺序需求，可以在这里排序
+    let mut patterns = config.name_clean.clone();
+    
+    // 按长度从长到短排序（优先处理复合词）
+    patterns.sort_by(|a, b| b.len().cmp(&a.len()));
+    patterns.dedup(); // 去重
+    
+    debug!("清理模式（按长度排序）: {:?}", patterns);
+    
+    for pattern in &patterns {
+        let original = cleaned.clone();
+        cleaned = cleaned.replace(pattern, "");
+        if cleaned != original {
+            info!("移除 '{}': {} -> {}", pattern, original, cleaned);
+        }
+    }
+    
+    cleaned = cleaned.trim().to_string();
+    
+    // 2. 应用名称映射（如果有）
+    if let Some(mapping) = &config.name_mapping {
+        if let Some(mapped_name) = mapping.get(&cleaned) {
+            info!("📺 频道映射: {} -> {}", cleaned, mapped_name);
+            return mapped_name.clone();
+        } 
+    } 
+    
+    // 3. 如果没有映射，返回清理后的名称
+    debug!("最终名称: {}", cleaned);
+    cleaned
+}
+
+
 #[get("/playlist")]
-async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
+async fn playlist(config: Data<YamlConfig>, _req: HttpRequest) -> impl Responder {
     debug!("Get playlist");
-    let scheme = req.connection_info().scheme().to_owned();
-    let host = req.connection_info().host().to_owned();
-    match get_channels(&args, false, &scheme, &host).await {
+    // let scheme = req.connection_info().scheme().to_owned();
+    // let host = req.connection_info().host().to_owned();
+    match get_channels(&config.iptv, false).await {
         Err(e) => {
+            println!(" playlist: 获取失败 {}", config.iptv.user);
             if let Some(old_playlist) = OLD_PLAYLIST.try_lock().ok().and_then(|f| f.to_owned()) {
                 HttpResponse::Ok()
                     .content_type("application/vnd.apple.mpegurl")
@@ -213,7 +283,13 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
             }
         }
         Ok(ch) => {
-            let playlist = String::from("#EXTM3U\n")
+
+            let m3u_header = if config.m3u8.x_tvg_url.is_empty() {
+                String::from("#EXTM3U\n")
+            } else {
+                format!("#EXTM3U x-tvg-url=\"{}\" \n", config.m3u8.x_tvg_url)
+            };
+            let playlist = m3u_header 
                 + &ch
                     .into_iter()
                     .map(|c| {
@@ -224,16 +300,58 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
                         } else {
                             "普通频道"
                         };
-                        let catch_up = format!(r#" catchup="append" catchup-source="{}?playseek=${{(b)yyyyMMddHHmmss}}-${{(e)yyyyMMddHHmmss}}" "#,
-                            c.igmp.as_ref().map(|_| &c.rtsp).unwrap_or(&"".to_string()));
+
+                        let tvgname = if config.m3u8.format_tvg {
+
+                            // 直接使用映射或格式化名称
+                            format_channel_name(&c.name, &config)
+                        } else {
+                            c.name.clone()
+                        };
+
+                        let tvglogo = format!("https://live.fanmingming.com/tv/{}.png", tvgname);
+ 
+
+                        let rtsp = if config.m3u8.rtsp_proxy_uri.is_empty() {
+                            c.rtsp 
+                        } else {
+                            c.rtsp.replace("rtsp://", &format!("{}/rtsp/", config.m3u8.rtsp_proxy_uri))
+                        };
+
+                        let catch_up = {
+                            let connector = if rtsp.contains('?') {
+                                "&"
+                            } else {
+                                "?"
+                            };
+                            format!(
+                                r#" catchup="default" catchup-source="{}{}playseek=${{(b)yyyyMMddHHmmss}}-${{(e)yyyyMMddHHmmss}}" "#,
+                                rtsp, connector
+                            )
+                        };
+
+                        let play_url = if config.m3u8.udp_proxy_uri.is_empty() {
+                            c.igmp 
+                        } else {
+                            c.igmp.replace("igmp://", &format!("{}/udp/", config.m3u8.udp_proxy_uri))
+                        };
+
+
+                        
                         format!(
-                            r#"#EXTINF:-1 tvg-id="{0}" tvg-name="{1}" tvg-chno="{0}"{3}tvg-logo="{4}://{5}/logo/{6}.png" group-title="{2}",{1}"#,
-                            c.id, c.name, group, catch_up, scheme, host, c.id
-                        ) + "\n" + if args.udp_proxy { c.igmp.as_ref().unwrap_or(&c.rtsp) } else { &c.rtsp }
+                            r#"#EXTINF:-1 tvg-id="{id}" tvg-name="{tvgname}" tvg-chno="{chno}" {catch_up} tvg-logo="{tvglogo}" group-title="{group}",{name}"#,
+                            id = c.id,
+                            chno = c.user_channel_id,
+                            name = c.name,
+                            group = group,
+                            catch_up = catch_up,
+                            tvglogo = tvglogo,
+                            tvgname = tvgname
+                        ) + "\n" + &play_url
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
-                + &match &args.extra_playlist {
+                + &match &config.m3u8.extra_playlist {
                     Some(u) => parse_extra_playlist(u).await.unwrap_or(String::from("")),
                     None => String::from(""),
                 };
@@ -247,84 +365,77 @@ async fn playlist(args: Data<Args>, req: HttpRequest) -> impl Responder {
     }
 }
 
-#[get("/rtsp/{tail:.*}")]
-async fn rtsp(
-    args: Data<Args>,
-    mut path: Path<String>,
-    mut params: Query<BTreeMap<String, String>>,
-) -> impl Responder {
-    let path = &mut *path;
-    let params = &mut *params;
-    let mut params = params.iter().map(|(k, v)| format!("{}={}", k, v));
-    let param = params.next().unwrap_or("".to_string());
-    let param = params.fold(param, |o, q| format!("{}&{}", o, q));
-    HttpResponse::Ok().streaming(proxy::rtsp(
-        format!("rtsp://{}?{}", path, param),
-        args.interface.clone(),
-    ))
-}
-
-#[get("/udp/{addr}")]
-async fn udp(args: Data<Args>, addr: Path<String>) -> impl Responder {
-    let addr = &*addr;
-    let addr = match SocketAddrV4::from_str(addr) {
-        Ok(addr) => addr,
-        Err(e) => return HttpResponse::BadRequest().body(format!("Error: {}", e)),
-    };
-    HttpResponse::Ok().streaming(proxy::udp(addr, args.interface.clone()))
-}
-
-fn usage(cmd: &str) -> std::io::Result<()> {
-    let usage = format!(
-        r#"Usage: {} [OPTIONS] --user <USER> --passwd <PASSWD> --mac <MAC>
-
-Options:
-    -u, --user <USER>                      Login username
-    -p, --passwd <PASSWD>                  Login password
-    -m, --mac <MAC>                        MAC address
-    -i, --imei <IMEI>                      IMEI [default: ]
-    -b, --bind <BIND>                      Bind address:port [default: 0.0.0.0:7878]
-    -a, --address <ADDRESS>                IP address/interface name [default: ]
-    -I, --interface <INTERFACE>            Interface to request
-        --extra-playlist <EXTRA_PLAYLIST>  Url to extra m3u
-        --extra-xmltv <EXTRA_XMLTV>        Url to extra xmltv
-        --udp-proxy                        Use UDP proxy
-        --rtsp-proxy                       Use rtsp proxy
-    -h, --help                             Print help
-"#,
-        cmd
-    );
-    eprint!("{}", usage);
-    exit(0);
+fn mask_password(password: &str) -> String {
+    let len = password.len();
+    match len {
+        0..=4 => password.to_string(),
+        5..=8 => {
+            // 对于5-8位密码，显示首尾各2位，中间4位用星号
+            let start = &password[0..2];
+            let end = &password[len-2..];
+            format!("{}****{}", start, end)
+        },
+        _ => {
+            // 对于9位及以上密码，显示前4位和后4位，中间用星号
+            let start = &password[0..4];
+            let end = &password[len-4..];
+            let middle_stars = "*".repeat(len - 8);
+            format!("{}{}{}", start, middle_stars, end)
+        }
+    }
 }
 
 #[actix_web::main] // or #[tokio::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
-    let args = std::env::args().collect::<Vec<_>>();
-    let args = args.iter().map(|s| s.as_str()).collect::<Vec<_>>();
-    let args: &[&str] = args.as_ref();
-    if args.is_empty() {
-        return usage("iptv");
-    }
-    let args = match Args::from_args(&args[0..1], &args[1..]) {
+
+    
+    // 解析命令行参数
+    let cli_args = match Args::parse() {
         Ok(args) => args,
-        Err(_) => {
-            return usage(args[0]);
+        Err(e) => {
+            eprintln!("❌ 参数解析错误: {}", e);
+            Args::usage("iptv");
+            std::process::exit(1);
         }
     };
 
-    HttpServer::new(move || {
-        let args = Data::new(argh::from_env::<Args>());
+    // 加载 YAML 配置
+    let config_path = PathBuf::from(&cli_args.config_file);
+    let yaml_config = match YamlConfig::from_file(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("❌ YAML 配置加载失败: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("📡 iptv账号:{}  密码:{}", yaml_config.iptv.user, mask_password(&yaml_config.iptv.passwd));
+
+    // 提前获取需要使用的值
+    let listen_addr = yaml_config.server.listen.clone();
+    let workers = yaml_config.server.workers.unwrap_or(4);
+
+    let server = HttpServer::new(move || {
+        let config_data = Data::new(yaml_config.clone());
         App::new()
             .service(xmltv)
             .service(playlist)
             .service(logo)
-            .service(rtsp)
-            .service(udp)
-            .app_data(args)
+            .app_data(config_data)
     })
-    .bind(args.bind)?
-    .run()
-    .await
+    .workers(workers)
+    .bind(&listen_addr)?;
+    
+    // 获取实际绑定的地址
+    let addrs: Vec<std::net::SocketAddr> = server.addrs();
+    for addr in &addrs {
+        println!("✅ 服务已启动: http://{}", addr);
+        println!("📺 XMLTV 地址: http://{}/xmltv", addr);
+        println!("📋 播放列表地址: http://{}/playlist", addr);
+        println!("🖼️ Logo 地址: http://{}/logo", addr);
+    }
+    
+    
+    server.run().await
 }

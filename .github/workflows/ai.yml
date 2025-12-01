@@ -1,0 +1,89 @@
+name: test suite
+on: [push, pull_request]
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            sdk: https://downloads.openwrt.org/releases/24.10.4/targets/x86/64/openwrt-toolchain-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+          - target: aarch64-unknown-linux-musl
+            sdk: https://downloads.openwrt.org/releases/24.10.4/targets/armsr/armv8/openwrt-toolchain-24.10.4-armsr-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+          # - target: mipsel-unknown-linux-musl
+          #   sdk: https://downloads.openwrt.org/releases/24.10.4/targets/ramips/mt7621/openwrt-toolchain-24.10.4-ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-
+      
+      - name: Cache OpenWrt SDK
+        uses: actions/cache@v3
+        id: sdk-cache
+        with:
+          path: ~/openwrt
+          key: ${{ runner.os }}-openwrt-${{ matrix.target }}-${{ matrix.sdk }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-${{ matrix.target }}-
+
+      - name: Download OpenWrt SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/openwrt
+          wget "${{ matrix.sdk }}" -qO- | tar --strip-components 1 -C ~/openwrt -xv --zstd
+
+
+
+
+
+      - name: Download rustup SDK
+        run: |
+          rustup toolchain add nightly
+          rustup +nightly component add rust-src
+          rustup +nightly target add ${{ matrix.target }} || true
+
+
+
+      - name: Build for OpenWrt
+        run: |
+
+
+          toolchain="$(ls -d ~/openwrt/toolchain-*)"
+          if [ "${{ matrix.target }}" == "mipsel-unknown-linux-musl" ]; then
+            res_dir="$(ls -d ${toolchain}/lib/gcc/*/*)"
+            cp ${res_dir}/libgcc.a ${res_dir}/libunwind.a
+            export RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -C linker=$(ls ${toolchain}/bin/*-openwrt-linux-gcc) -L${toolchain}/lib -L${res_dir}"
+          else
+            export RUSTFLAGS="-C target-feature=+crt-static -Zlocation-detail=none -C linker=$(ls ${toolchain}/bin/*-openwrt-linux-gcc)"
+          fi
+
+          cargo +nightly build \
+            -Z build-std=std,panic_abort \
+            --release \
+            --target ${{ matrix.target }}
+
+
+          upx -9 target/${{ matrix.target }}/release/iptv
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iptv-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/iptv

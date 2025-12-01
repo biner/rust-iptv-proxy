@@ -1,1 +1,4 @@
 /target
+web.sh
+.DS_Store
+dev.yaml
