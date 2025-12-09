@@ -1,19 +1,51 @@
 server:
   listen: 0.0.0.0:7878
   workers: 4
-  timeout: 30
   log_level: "info"
 
 iptv:
-  user: true
-  passwd: 36000000
-  mac:
+  user: "075512345678"
+  passwd: "12345678"
+  mac: "FF:FF:FF:FF:FF:FF"
   imei:
+  ip: 
+  interface: 
 
 m3u8:
-  x_tvg_url:
-  format_tvg:
-  extra_playlist:
+  x_tvg_url: https://gh-proxy.com/raw.githubusercontent.com/kuke31/xmlgz/main/all.xml.gz
+  format_tvg: True
+  extra_playlist: http://iptv.myserver.xyz/shoudong.m3u
   extra_xmltv:
-  udp_proxy_uri:
-  rtsp_proxy_uri:
+  udp_proxy_uri: http://192.168.100.11:5146
+  rtsp_proxy_uri: http://192.168.100.11:5146
+
+# 频道名称清理 
+name_clean:
+  - "4K超高清"
+  - "高清"
+  - "超清" 
+  - "试验"
+  - "超高清"
+  - "-"
+  - "（50P)"
+
+# 频道名称映射
+name_mapping:
+  "旅游": "环球旅游"
+  "爱体育": "劲爆体育"
+  "魅力时尚": "生活时尚"
+  "KAKU少儿": "卡酷少儿"
+  "少儿动画": "少儿动漫"
+  "湖南金鹰纪实": "金鹰纪实"
+  "深圳体育": "深圳体育健康"
+  "中国教育1": "CETV1"
+  "中国教育2": "CETV2"
+  "中国教育3": "CETV3"
+  "中国教育4": "CETV4"
+  "新疆兵团卫视": "新疆卫视"
+  "爱电影": "CHC动作电影"
+  "CCTV2财经": "CCTV2财经"
+  "CCTV7军事农业": "CCTV7"
+  "CCTV10科教": "CCTV10"
+  "CCTV1综合": "CCTV1"
+  "CCTV": "CCTV4K"

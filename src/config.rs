@@ -16,10 +16,30 @@ pub struct YamlConfig {
 /// 服务器配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
+    #[serde(default = "default_listen")]
     pub listen: String,
-    pub workers: Option<usize>,
-    pub timeout: Option<u64>,
-    pub log_level: Option<String>,
+    
+    #[serde(default = "default_workers")]
+    pub workers: usize,
+    
+    // #[serde(default = "default_timeout")]
+    // pub timeout: u64,
+    
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_listen() -> String {
+    "0.0.0.0:7878".to_string()
+}
+
+fn default_workers() -> usize {
+    4
+}
+
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 /// IPTV 认证配置

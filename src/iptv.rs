@@ -1,7 +1,8 @@
 use crate::config::IptvConfig;
 
-
-use anyhow::{anyhow, Result};
+use chrono::{ NaiveDate,  TimeZone, Utc};
+use chrono::Duration as ChronoDuration;
+use anyhow::{Result, Context, anyhow};
 use des::{
     cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit},
     TdesEde3,
@@ -13,9 +14,7 @@ use rand::Rng;
 use regex_lite::Regex;
 use reqwest::Client;
 use serde::Deserialize;
-use std::{
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 
 fn get_client_with_if(#[allow(unused_variables)] if_name: Option<&str>) -> Result<Client> {
@@ -107,25 +106,44 @@ struct Bill {
     #[serde(rename = "endTime")]
     end_time: i64,
 }
-
-pub(crate) async fn get_channels(
-    args: &IptvConfig,
-    need_epg: bool,
-) -> Result<Vec<Channel>> {
-    info!("Obtaining channels");
+/// 登录 IPTV 系统，返回认证后的 client 和 base_url
+pub(crate) async fn login_iptv(args: &IptvConfig) -> Result<(reqwest::Client, String)> {
+    static mut CACHED_RESULT: Option<(reqwest::Client, String, Instant)> = None;
+    const CACHE_DURATION: Duration = Duration::from_secs(1800);
+    
+    unsafe {
+        // 获取原始指针
+        let cached_ptr = &raw const CACHED_RESULT;
+        
+        // 解引用指针获取 Option
+        match *cached_ptr {
+            Some((ref client, ref base_url, cached_time)) => {
+                if cached_time.elapsed() < CACHE_DURATION {
+                    info!("使用缓存的登录会话");
+                    return Ok((client.clone(), base_url.clone()));
+                }
+            }
+            None => {}
+        }
+    }
+    
+    info!("开始登录 IPTV 系统");
 
     let start_time = std::time::Instant::now();
-
+    
     let user = args.user.as_str();
     let passwd = args.passwd.as_str();
     let mac = args.mac.as_str();
     let imei = args.imei.as_deref().unwrap_or("default_imei");
     let ip = args.ip.as_deref().unwrap_or("0.0.0.0");
 
+    // 创建客户端
     let client = get_client_with_if(args.interface.as_deref())?;
 
+    // 获取基础 URL
     let base_url = get_base_url(&client, args).await?;
 
+    // 第一步：获取 token
     let params = [
         ("response_type", "EncryToken"),
         ("client_id", "smcphone"),
@@ -136,11 +154,10 @@ pub(crate) async fn get_channels(
         params,
     )?;
     let response = client.get(url).send().await?.error_for_status()?;
-
     let token = response.json::<TokenJson>().await?.encry_token;
-
     debug!("Got token {token}");
 
+    // 第二步：生成认证信息
     let enc = ecb::Encryptor::<TdesEde3>::new_from_slice(
         format!("{:X}", md5::compute(passwd.as_bytes()))[0..24].as_bytes(),
     );
@@ -151,14 +168,15 @@ pub(crate) async fn get_channels(
             format!("Encrypt error {e}"),
         )),
     }?;
+    
     let data = format!(
         "{}${token}${user}${imei}${ip}${mac}$$CTC",
         rand::thread_rng().gen_range(0..10000000),
     );
     let auth = hex::encode_upper(enc.encrypt_padded_vec_mut::<Pkcs7>(data.as_bytes()));
-
     debug!("Got auth {auth}");
 
+    // 第三步：获取访问令牌
     let params = [
         ("client_id", "smcphone"),
         ("DeviceType", "deviceType"),
@@ -170,73 +188,118 @@ pub(crate) async fn get_channels(
         ("authinfo", auth.as_str()),
         ("grant_type", "EncryToken"),
     ];
-    let url =
-        reqwest::Url::parse_with_params(format!("{base_url}/EPG/oauth/v2/token").as_str(), params)?;
+    let url = reqwest::Url::parse_with_params(
+        format!("{base_url}/EPG/oauth/v2/token").as_str(),
+        params,
+    )?;
+    
     let _response = client.get(url).send().await?.error_for_status()?;
+    
+    // 缓存结果
+    unsafe {
+        CACHED_RESULT = Some((client.clone(), base_url.clone(), Instant::now()));
+    }
+    
+    let elapsed = start_time.elapsed();
+    info!("成功登录 IPTV 系统，耗时: {:?}", elapsed);
+    
+    Ok((client, base_url))
+}
 
-    let url = reqwest::Url::parse(format!("{base_url}/EPG/jsp/getchannellistHWCTC.jsp").as_str())?;
-
+/// 获取频道列表（不包含 EPG）
+pub(crate) async fn get_channel_list(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<Vec<Channel>> {
+    info!("Fetching channel list");
+    let start_time = std::time::Instant::now();
+    
+    let url = reqwest::Url::parse(
+        format!("{}/EPG/jsp/getchannellistHWCTC.jsp", base_url).as_str()
+    )?;
+    
     let response = client.get(url).send().await?.error_for_status()?;
-
     let res = response.text().await?;
-            
-    // 使用更精确的正则表达式匹配频道信息
-    let channel_pattern = Regex::new(r#"(?m)Authentication.CTCSetConfig([^"]*)ChannelID="([^"]*)",ChannelName="([^"]*)",UserChannelID="([^"]*)",ChannelURL="([^|]*)\|([^"]*)",(.*?)TimeShiftURL="([^"]*)""#)?;
-
-    // iRet = Authentication.CTCSetConfig('Channel','ChannelID="10799",ChannelName="深圳都市",UserChannelID="1002",ChannelURL="igmp://239.77.1.176:5146|rtsp://183.59.160.198/PLTV/88888895/224/3221228036/10000100000000060000000007005128_0.smil?rrsip=",TimeShift="1",TimeShiftLength="7200",ChannelSDP="igmp://239.77.1.176:5146|rtsp://183.59.160.198/PLTV/88888895/224/3221228036/10000100000000060000000007005128_0.smil",TimeShiftURL="rtsp://183.59.160.198/PLTV/88888895/224/3221228036/10000100000000060000000007005128_0.smil?rrsip=125.88.70.140,rrsip=125.88.104.40&zoneoffset=0&icpid=&limitflux=-1&limitdur=-1&tenantId=8601&GuardEncType=2&accountinfo=%7E%7EV2.0%7EqaHhGruMstwIkaFtk0MP7A%7EGLOFB5O3kvJE5I3TTb2pEnLv4APVPB7NMPEjL0UknV8dFj2VERn_IP31ISGmAOZRDmdJGvBiqO7hRNodRy4KDtUxzPGT5g3dzUoMzbpT76I%7EExtInfoPC2ZKLw95m5z2wHEEFeSaQ%3A20251201003536%2C8982293%2C10.101.36.213%2C20251201003536%2C31000100000000050000000000440672%2C8982293%2C-1%2C0%2C1%2C%2C%2C7%2C%2C%2C%2C4%2C%2C10000100000000060000000007005128_0%2CEND",ChannelType="1",IsHDChannel="1",PreviewEnable="0",ChannelPurchased="1",ChannelLocked="0",ChannelLogURL="",PositionX="",PositionY="",BeginTime="0",Interval="",Lasting="",ActionType="1",FCCEnable="0",ChannelFECPort="5145"');
-
+    
+    let channel_pattern = Regex::new(
+        r#"(?m)Authentication.CTCSetConfig([^"]*)ChannelID="([^"]*)",ChannelName="([^"]*)",UserChannelID="([^"]*)",ChannelURL="([^|]*)\|([^"]*)",(.*?)TimeShiftURL="([^"]*)""#
+    )?;
+    
     let mut channels = Vec::new();
-
-    // 首先尝试使用新的精确正则表达式
+    
     for cap in channel_pattern.captures_iter(&res) {
         let channel_id = cap[2].to_string();
-        let channel_name = cap[3].to_string().replace('＋', "+").replace(' ', "");
+        let channel_name = cap[3].to_string().replace('＋', "+").replace(' ', "").replace('-', "");
         let user_channel_id = cap[4].to_string();
         let igmp = cap[5].to_string();
-        // let rtsp = cap[6].to_string();
         let time_shift_url = cap[8].to_string();
-
-        // 将 UserChannelID 转换为 u64
+        
         let channel_id = channel_id.parse::<u64>()
             .unwrap_or_else(|_| {
-                // 如果解析失败，使用哈希值作为备用方案
                 channel_id.as_str().chars().map(|c| c as u64).sum()
             });
-
-
-        debug!("igmp {} ", igmp);
-
+        
+        debug!("Found channel: {} (ID: {})", channel_name, channel_id);
+        
         let channel = Channel {
             id: channel_id,
-            user_channel_id: user_channel_id,
+            user_channel_id,
             name: channel_name,
-            rtsp: time_shift_url, // 或者根据实际情况决定使用哪个 URL
-            igmp: igmp, // 根据你的数据源设置 IGMP 地址
-            epg: Vec::new(), // 初始化为空，后续可以填充 EPG 数据
+            rtsp: time_shift_url,
+            igmp,
+            epg: Vec::new(),
         };
         channels.push(channel);
     }
-        
-        
+    
     info!("Got {} channel(s)", channels.len());
+    let elapsed = start_time.elapsed();
+    println!("📡 获取频道列表... in {:?}", elapsed);
+    Ok(channels)
+}
 
+pub(crate) async fn get_channels(
+    args: &IptvConfig,
 
-    if !need_epg {
-        let elapsed = start_time.elapsed();
-        println!("📡 获取频道列表... in {:?}", elapsed);
-        return Ok(channels);
-    }
+) -> Result<Vec<Channel>> {
+    info!("Obtaining channels");
+
+    // 1. 登录获取认证后的客户端
+    let (client, base_url) = login_iptv(args).await?;
+    
+    // 2. 获取频道列表
+    let channels = get_channel_list(&client, &base_url).await?;
+
+    Ok(channels)
+}
+
+pub(crate) async fn get_channels_epg(
+    args: &IptvConfig,
+
+) -> Result<Vec<Channel>> {
+
+    let start_time = std::time::Instant::now();
+
+    // 1. 登录获取认证后的客户端
+    let (client, base_url) = login_iptv(args).await?;
+    
+    // 2. 获取频道列表
+    let channels = get_channel_list(&client, &base_url).await?;
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-
+    let begin_timestamp = now - 86400000 * 7;
+    let end_timestamp = now + 86400000 * 2;
     let mut tasks = JoinSet::new();
 
     for channel in channels.into_iter() {
         let params = [
             ("channelId", format!("{}", channel.id)),
-            ("begin", format!("{}", now - 86400000 * 7)),
-            ("end", format!("{}", now + 86400000 * 2)),
+            ("begin", format!("{}", begin_timestamp)),
+            ("end", format!("{}", end_timestamp)),
         ];
+
+        info!("请求参数:channle_id={} begin={}, end={}",channel.id  , begin_timestamp, end_timestamp);
+
         let url = reqwest::Url::parse_with_params(
             format!("{base_url}/EPG/jsp/iptvsnmv3/en/play/ajax/_ajax_getPlaybillList.jsp").as_str(),
             params,
@@ -247,6 +310,7 @@ pub(crate) async fn get_channels(
     let mut channels = vec![];
     while let Some(Ok((Ok(res), mut channel))) = tasks.join_next().await {
         if let Ok(play_bill_list) = res.json::<PlaybillList>().await {
+            debug!("获得节目单信息:channle_id={} begin={}, end={}, 数量={}",channel.id  , begin_timestamp, end_timestamp, play_bill_list.list.len());
             for bill in play_bill_list.list.into_iter() {
                 channel.epg.push(Program {
                     start: bill.start_time,
@@ -259,11 +323,114 @@ pub(crate) async fn get_channels(
         channels.push(channel);
     }
 
-    let elapsed = start_time.elapsed();
+    let elapsed: Duration = start_time.elapsed();
     println!("📋 获取epg信息... in {:?}", elapsed);
 
     Ok(channels)
 }
+
+/// 获取指定频道在指定日期的 EPG 数据
+pub(crate) async fn get_channel_date_epg(
+    args: &IptvConfig,
+    channel_id: u64,
+    date: &str,
+) -> Result<Channel> {
+    info!("获取频道 {} 在 {} 的 EPG 数据", channel_id, date);
+
+    // 1. 登录获取认证后的客户端
+    let (client, base_url) = login_iptv(args).await?;
+
+
+    let mut target_channel  = Channel {
+        id: channel_id,
+        user_channel_id: String::new(),
+        name: String::new(),
+        rtsp: String::new(),
+        igmp: String::new(),
+        epg: Vec::new(),
+    };
+
+    let start_time = std::time::Instant::now();
+
+    // 3. 解析日期，获取时间范围
+    let (begin_timestamp, end_timestamp) = cal_date_range(&date)?;
+
+    debug!("请求参数: channel_id={} date={} begin={} end={}", 
+          channel_id, date, begin_timestamp, end_timestamp);
+
+    // 4. 只获取目标频道的 EPG
+    let params = [
+        ("channelId", format!("{}", channel_id)),
+        ("begin", format!("{}", begin_timestamp)),
+        ("end", format!("{}", end_timestamp)),
+    ];
+
+    let url = reqwest::Url::parse_with_params(
+        format!("{}/EPG/jsp/iptvsnmv3/en/play/ajax/_ajax_getPlaybillList.jsp", base_url).as_str(),
+        params,
+    )?;
+
+    // 5. 发送请求
+    let response = client.get(url).send().await?.error_for_status()?;
+    
+    let play_bill_list: PlaybillList = response.json().await?;
+
+    // 8. 填充 EPG 数据
+    target_channel.epg.clear(); // 清空现有 EPG 数据
+    for bill in play_bill_list.list.into_iter() {
+        debug!("EPG: {} - {}", bill.start_time, bill.name);
+        target_channel.epg.push(Program {
+            start: bill.start_time,
+            stop: bill.end_time,
+            title: bill.name.clone(),
+            desc: bill.name,
+        });
+    }
+
+    let elapsed = start_time.elapsed();
+    info!("📋 获取频道 {} 在 {} 的 EPG 数据完成，耗时 {:?}，共 {} 条节目", 
+          channel_id, date, elapsed, target_channel.epg.len());
+
+    Ok(target_channel)
+}
+
+
+/// 解析日期字符串，总是返回当天0点时间
+fn cal_date_range(date_str: &str) -> Result<(i64, i64)> {
+    // 尝试多种日期格式
+    let formats = [
+        "%Y%m%d",        // 20241201
+        "%Y-%m-%d",      // 2024-12-01
+        "%Y/%m/%d",      // 2024/12/01
+        "%d-%m-%Y",      // 01-12-2024
+        "%d/%m/%Y",      // 01/12/2024
+    ];
+    
+    let mut parsed_date = None;
+    for &format in &formats {
+        if let Ok(date) = NaiveDate::parse_from_str(date_str, format) {
+            parsed_date = Some(date);
+            break;
+        }
+    }
+    
+    let naive_date = parsed_date.ok_or_else(|| 
+        anyhow!("无法解析日期字符串: {}。支持的格式: YYYYMMDD, YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY, DD/MM/YYYY", date_str)
+    )?;
+    
+    // 当天0点的UTC时间
+    let start_datetime = Utc.from_utc_datetime(&naive_date.and_hms_opt(0, 0, 0)
+        .context("无法创建当天0点时间")?);
+    
+    // 次日0点
+    let end_datetime = start_datetime + ChronoDuration::days(1);
+    
+    // 转换为毫秒时间戳
+    Ok((start_datetime.timestamp_millis(), end_datetime.timestamp_millis()))
+    
+
+}
+
 
 pub(crate) async fn get_icon(args: &IptvConfig, id: &str) -> Result<Vec<u8>> {
     let client = get_client_with_if(args.interface.as_deref())?;

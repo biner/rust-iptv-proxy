@@ -66,9 +66,9 @@ impl Args {
 
 
 
-    /// 验证必需参数
-    pub fn validate(&self) -> Result<(), String> {
+    // /// 验证必需参数
+    // pub fn validate(&self) -> Result<(), String> {
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
